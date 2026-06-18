@@ -1,0 +1,14 @@
+premium_extractor:
+  log_path: "logs"
+  db_path: "data/scanner.db"
+  
+ibkr:
+  host: "127.0.0.1"
+  port: 7497
+  scanner_client_id: 15
+  spot_client_id: 16
+  scan_interval: 60
+
+supabase:
+  enabled: true
+  dual_write: true
