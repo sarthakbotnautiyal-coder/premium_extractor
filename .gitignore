@@ -1,15 +1,58 @@
+# --- Secrets / local config ---
 .env
 .env.local
+
+# --- Python ---
 __pycache__/
 *.py[cod]
-.venv
+*.egg-info/
+
+# --- Virtualenvs ---
+.venv/
 venv/
+
+# --- Logs (date-prefixed rotation; tests write here too) ---
 logs/
+logs/*.log
+logs/*.log.*
+
+# --- Data (local SQLite + WAL sidecars) ---
 data/
+data/*.db
+data/*.db-journal
+data/*.db-shm
+data/*.db-wal
+
+# --- Generic SQLite sidecars (anywhere in the repo) ---
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
+
+# --- pytest + coverage artifacts ---
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- Editor / OS junk ---
 .DS_Store
 .vscode/
 .idea/
+*.swp
+
+# --- Workspace bootstrap files (these belong to the OpenClaw agent
+#     workspace, NOT to the project repo; never commit them) ---
+.openclaw/
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
+
+# --- Root-level smoke / validation scripts (kept in /tmp/ or workspace
+#     as one-offs; never committed) ---
+validation_test.py
+smoke_*.py
