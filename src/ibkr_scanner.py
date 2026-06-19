@@ -37,6 +37,7 @@ def _handle_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, _handle_sigterm)
 from config import CONFIG
 from log_setup import get_scanner_logger
+from tradingview_reader import get_tv_spot
 
 
 
@@ -62,6 +63,14 @@ ANCHOR_INTERVAL_SECS = 180        # re-find the 0.03-delta strike at least this 
 ANCHOR_SPOT_MOVE_PCT = 0.003      # ...or sooner if spot moves this far since last anchor
 ANCHOR_BAND_PCT = 0.015           # cold-start: one-sided OTM band (ATM→+1.5% calls, ATM→-1.5% puts)
 ANCHOR_NEIGHBOURHOOD_STRIKES = 10 # warm re-anchor: search ±10 strikes (~±50pts) around last short
+
+# --- TradingView fallback spot (when the IBKR SPX index feed freezes) ---
+# tradingview.db carries an SPX price (~1 row/min). When the IBKR index feed
+# freezes, we fall back to this so the anchor isn't stuck on a stale price, and
+# we cross-check it against the index feed even when that feed *looks* fresh
+# (a frozen feed can report a static value with a fresh timer).
+TV_SPOT_STALENESS_SECS   = 90    # reject TV spot if its latest row is older than this
+TV_CROSSCHECK_DIVERGENCE = 15.0  # pts: index vs TV disagreement that flags a frozen index feed
 # ----------------------------
 
 
@@ -231,6 +240,7 @@ class SpxSpotFeed:
         self._ticker = None
         self._spot = float("nan")
         self._last_change_time = None   # datetime of last price change
+        self._last_full_reconnect = None  # throttle full reconnects
         self._lock = threading.Lock()
 
     def ensure_started(self) -> None:
@@ -265,6 +275,28 @@ class SpxSpotFeed:
             self._ticker = None
             self._spot = float("nan")
             self._last_change_time = None
+
+    def force_full_reconnect(self, min_interval_secs: float = 120.0) -> bool:
+        """Tear down and rebuild the spot connection — the only reliable cure
+        for a frozen SPX index data-farm subscription (a soft re-subscribe just
+        gets the same frozen value back). Throttled to avoid hammering the
+        Gateway; returns True only when a reconnect was actually issued."""
+        now = datetime.now(EST)
+        if (self._last_full_reconnect is not None
+                and (now - self._last_full_reconnect).total_seconds() < min_interval_secs):
+            return False
+        self._last_full_reconnect = now
+        self.stop()
+        try:
+            self.ib.disconnect()
+        except Exception:
+            pass
+        self.ib.sleep(2)
+        self._contract = None  # force re-qualify on the fresh connection
+        self.ib.connect(HOST, PORT, clientId=SPOT_CLIENT_ID, timeout=10)
+        self.ib.reqMarketDataType(MKT_DATA_TYPE)
+        self.ensure_started()
+        return True
 
     def _update_spot(self, ticker) -> None:
         """Update cached spot and timestamp when price changes."""
@@ -562,14 +594,51 @@ def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer
     spot_feed.ensure_started()
 
     spot, spot_age = spot_feed.get_spot()
-    if math.isnan(spot):
-        raise RuntimeError("Could not get SPX spot price")
 
     # True staleness check: has the price actually CHANGED recently? We track the
     # last PRICE CHANGE timestamp, since a frozen feed still reports a fresh
     # ticker.time on snapshot requests.
-    if spot_age > SPOT_STALENESS_SECS:
-        raise RuntimeError(f"SPX spot is stale: unchanged for {spot_age:.0f}s (price={spot:.2f})")
+    primary_ok = (not math.isnan(spot)) and (spot_age <= SPOT_STALENESS_SECS)
+
+    # TV fallback spot (~1 row/min, ≤~60s fresh) from tradingview.db. Used when
+    # the IBKR index feed freezes, and as an independent cross-check even when
+    # the index feed *looks* fresh (it can report a static value with a fresh
+    # timer). Reject it if TV's own upstream process has stalled.
+    tv_price, tv_age = get_tv_spot()
+    tv_ok = (tv_price is not None) and (tv_age is not None) and (tv_age <= TV_SPOT_STALENESS_SECS)
+
+    # Cross-check: a fresh-looking index feed that disagrees with TV by a wide
+    # margin is the frozen-but-timer-fresh case — distrust the index feed.
+    if primary_ok and tv_ok and abs(spot - tv_price) > TV_CROSSCHECK_DIVERGENCE:
+        log.warning(
+            f"SPX index feed diverges from TV by {abs(spot - tv_price):.1f}pts "
+            f"(index={spot:.2f} tv={tv_price:.2f}) — distrusting index feed."
+        )
+        primary_ok = False
+
+    force_anchor = False
+    if primary_ok:
+        pass  # use the IBKR index spot as-is
+    elif tv_ok:
+        log.warning(
+            f"Primary SPX feed unusable (age={spot_age:.0f}s price={spot:.2f}) — "
+            f"falling back to TV spot={tv_price:.2f} (age={tv_age:.0f}s); "
+            "forcing re-anchor and rebuilding the IBKR spot feed."
+        )
+        spot = tv_price
+        force_anchor = True
+        # Escalate: only a full reconnect reliably revives a frozen SPX index
+        # data-farm subscription. Throttled internally to avoid hammering.
+        try:
+            if spot_feed.force_full_reconnect():
+                log.info("SPX spot feed full reconnect issued.")
+        except Exception as e:
+            log.warning(f"SPX spot feed full reconnect failed: {e}")
+    else:
+        raise RuntimeError(
+            f"SPX spot unavailable: index stale (age={spot_age:.0f}s price={spot:.2f}), "
+            f"TV stale/missing (age={tv_age} price={tv_price})"
+        )
 
     cache.last_spot = spot
 
@@ -577,8 +646,11 @@ def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer
     ensure_chain(ib, cache, spot)
 
     # 3) Re-anchor the 0.03-delta short strikes if stale or spot has drifted.
+    #    force_anchor is set when we fell back to TV — the prior anchor was
+    #    chosen from a now-distrusted index price, so re-anchor immediately.
     need_anchor = (
-        cache.anchor_time is None
+        force_anchor
+        or cache.anchor_time is None
         or cache.anchor_spot is None
         or (datetime.now(EST) - cache.anchor_time).total_seconds() > ANCHOR_INTERVAL_SECS
         or abs(spot - cache.anchor_spot) / cache.anchor_spot > ANCHOR_SPOT_MOVE_PCT
