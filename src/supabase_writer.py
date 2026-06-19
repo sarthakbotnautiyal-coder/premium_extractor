@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import threading
 from datetime import datetime, timezone
@@ -18,7 +17,9 @@ except ImportError:
     Client = None
     create_client = None
 
-logger = logging.getLogger(__name__)
+from log_setup import get_scanner_logger
+
+logger = get_scanner_logger("scanner")
 
 CLOUD_SCHEMA = "trading"
 CLOUD_TABLE = "scan_results"
