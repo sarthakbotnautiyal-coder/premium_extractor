@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import CONFIG
 
 # Read path from config
-TV_DB_PATH = CONFIG.get("data_sources", {}).get("tradingview_db", "../../tradingView_signal_generator/data/tradingview.db")
-TV_DB = Path(TV_DB_PATH).resolve() if Path(TV_DB_PATH).exists() or Path(TV_DB_PATH).is_absolute() else Path(__file__).parent.parent.parent / TV_DB_PATH
+TV_DB_PATH = CONFIG.get("data_sources", {}).get("tradingview_db", "../tradingView_signal_generator/data/tradingview.db")
+TV_DB = Path(TV_DB_PATH).resolve() if Path(TV_DB_PATH).exists() or Path(TV_DB_PATH).is_absolute() else Path(__file__).parent.parent / TV_DB_PATH
 
 _LOG = logging.getLogger("tradingview_reader")
 
