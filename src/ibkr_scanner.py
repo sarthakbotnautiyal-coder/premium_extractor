@@ -75,7 +75,7 @@ TV_CROSSCHECK_DIVERGENCE = 15.0  # pts: index vs TV disagreement that flags a fr
 
 
 # ---------- LOGGING SETUP ----------
-_LOGS_DIR = Path(__file__).parent / CONFIG["paths"]["logs"]
+_LOGS_DIR = Path(__file__).parent.parent / CONFIG["premium_extractor"]["log_path"]
 log = get_scanner_logger("scanner", _LOGS_DIR)
 # ----------------------------------
 
