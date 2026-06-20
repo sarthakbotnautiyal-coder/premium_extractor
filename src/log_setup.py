@@ -1,13 +1,18 @@
 """Logging setup for premium_extractor."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
+# Trading timezone — log files rotate on the Eastern (EST/EDT) calendar day so
+# filenames line up with the market session rather than UTC.
+_ET = ZoneInfo("America/New_York")
 
-def _utc_date_str() -> str:
-    """Return today's UTC date as YYYY-MM-DD."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _et_date_str() -> str:
+    """Return today's Eastern (EST/EDT) date as YYYY-MM-DD."""
+    return datetime.now(_ET).strftime("%Y-%m-%d")
 
 
 def _current_file_handler(logger: logging.Logger) -> logging.FileHandler | None:
@@ -20,7 +25,7 @@ def _current_file_handler(logger: logging.Logger) -> logging.FileHandler | None:
 
 def _install_file_handler(logger: logging.Logger, log_dir: Path, name: str) -> None:
     """Install (or replace) a date-prefixed FileHandler on logger."""
-    handler = logging.FileHandler(log_dir / f"{name}.{_utc_date_str()}.log")
+    handler = logging.FileHandler(log_dir / f"{name}.{_et_date_str()}.log")
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
@@ -30,8 +35,8 @@ def _install_file_handler(logger: logging.Logger, log_dir: Path, name: str) -> N
 
 
 def _ensure_current_day_handler(logger: logging.Logger, log_dir: Path, name: str) -> None:
-    """Replace the FileHandler if the UTC date has rolled over."""
-    today = _utc_date_str()
+    """Replace the FileHandler if the Eastern date has rolled over."""
+    today = _et_date_str()
     existing = _current_file_handler(logger)
     if existing is None:
         _install_file_handler(logger, log_dir, name)
@@ -50,10 +55,10 @@ def _ensure_current_day_handler(logger: logging.Logger, log_dir: Path, name: str
 
 
 def get_scanner_logger(name: str, log_dir: str = "logs") -> logging.Logger:
-    """Get a configured logger with daily UTC-rotated file handler.
+    """Get a configured logger with daily Eastern-rotated file handler.
 
-    The file handler writes to ``logs/<name>.YYYY-MM-DD.log`` (UTC date).
-    On every call the current UTC date is checked and, if it has changed
+    The file handler writes to ``logs/<name>.YYYY-MM-DD.log`` (Eastern date).
+    On every call the current Eastern date is checked and, if it has changed
     since the last setup, the file handler is replaced so logs land in the
     new day's file.
 

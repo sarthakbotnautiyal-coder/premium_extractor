@@ -399,7 +399,7 @@ class ScanCache:
         self.anchor_time = None
 
     def is_valid_for_today(self) -> bool:
-        today = datetime.now().strftime("%Y%m%d")
+        today = datetime.now(EST).strftime("%Y%m%d")
         return self.expiry == today and self.chain is not None
 
     def reset(self):
@@ -426,7 +426,7 @@ def ensure_chain(ib: IB, cache: ScanCache, spot: float) -> None:
     if chain is None:
         chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = datetime.now(EST).strftime("%Y%m%d")
     if today not in chain.expirations:
         raise RuntimeError(f"No 0DTE expiry today ({today})")
 

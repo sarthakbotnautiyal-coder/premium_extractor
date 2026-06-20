@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 from pathlib import Path
 
 import pytest
@@ -60,7 +63,7 @@ def test_creates_date_prefixed_log_file(fresh_logger) -> None:
     # Trigger at least one log line so the file is flushed
     logger.info("hello")
 
-    expected = tmp_path / f"{name}.{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+    expected = tmp_path / f"{name}.{datetime.now(_ET).strftime('%Y-%m-%d')}.log"
     assert expected.exists(), f"expected log file {expected} to exist"
     assert DATE_PATTERN.match(str(expected)), (
         f"log filename {expected!s} does not match YYYY-MM-DD pattern"
@@ -123,18 +126,18 @@ def test_logger_level_is_info(fresh_logger) -> None:
 
 def test_handles_rollover_when_date_changes(tmp_path: Path) -> None:
     """If a stale FileHandler is left over for a previous date, get_scanner_logger
-    must swap it out for one matching today's UTC date on the next call.
+    must swap it out for one matching today's Eastern date on the next call.
     """
     name = f"test_rollover_{id(test_handles_rollover_when_date_changes)}"
     # First call — installs today's handler
     logger = get_scanner_logger(name, log_dir=str(tmp_path))
     today_file = _file_handlers(logger)[0].baseFilename
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_str = datetime.now(_ET).strftime("%Y-%m-%d")
     assert today_str in today_file
 
     # Simulate a date rollover by replacing the FileHandler with one pointing
     # at a previous day's filename (mimicking what would happen if the
-    # process stayed up across UTC midnight without our swap logic).
+    # process stayed up across Eastern midnight without our swap logic).
     import log_setup as ls
 
     stale_date = "2000-01-01"
@@ -187,7 +190,7 @@ def test_ensure_handler_installs_when_only_streamhandler_present(tmp_path: Path)
             f"expected exactly one FileHandler after installing from a "
             f"no-file-handler state, got {len(file_handlers)}"
         )
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_str = datetime.now(_ET).strftime("%Y-%m-%d")
         assert today_str in file_handlers[0].baseFilename
         # StreamHandler preserved
         assert _console_handlers(result), "console handler should have been preserved"
