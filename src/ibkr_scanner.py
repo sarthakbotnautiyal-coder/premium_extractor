@@ -231,15 +231,16 @@ def safe_round(x, n=2):
 class SpxSpotFeed:
     """
     Persistent streaming SPX spot feed using reqMktData.
-    Solves the frozen-snapshot problem by tracking when the PRICE actually
-    last changed, not when the ticker object was last accessed.
+    Solves the frozen-snapshot problem by tracking when the feed last
+    received data from IBKR, not just when the price changed.
     """
     def __init__(self, ib: IB):
         self.ib = ib
         self._contract = None
         self._ticker = None
         self._spot = float("nan")
-        self._last_change_time = None   # datetime of last price change
+        self._last_tick_time = None     # datetime of last tick received from IBKR
+        self._last_change_time = None   # datetime of last price change (for debugging)
         self._last_full_reconnect = None  # throttle full reconnects
         self._lock = threading.Lock()
 
@@ -274,6 +275,7 @@ class SpxSpotFeed:
                 pass
             self._ticker = None
             self._spot = float("nan")
+            self._last_tick_time = None
             self._last_change_time = None
 
     def force_full_reconnect(self, min_interval_secs: float = 120.0) -> bool:
@@ -299,20 +301,22 @@ class SpxSpotFeed:
         return True
 
     def _update_spot(self, ticker) -> None:
-        """Update cached spot and timestamp when price changes."""
+        """Update spot price and mark that we received a tick from the feed."""
         mp = ticker.marketPrice()
         new_spot = mp if (mp and not math.isnan(mp)) else ticker.close
         if new_spot and not math.isnan(new_spot):
             with self._lock:
                 changed = math.isnan(self._spot) or abs(self._spot - new_spot) > 0.001
                 self._spot = new_spot
+                self._last_tick_time = datetime.now(EST)  # mark that feed is alive
                 if changed:
                     self._last_change_time = datetime.now(EST)
 
     def get_spot(self) -> tuple[float, float]:
         """
-        Returns (spot, seconds_since_last_change).
-        seconds_since_last_change is the true staleness metric.
+        Returns (spot, seconds_since_last_tick).
+        Staleness is based on when the feed last received ANY data from IBKR,
+        not just when the price changed.
         """
         t = self._ticker
         if t is not None:
@@ -320,11 +324,11 @@ class SpxSpotFeed:
 
         with self._lock:
             spot = self._spot
-            last_change = self._last_change_time
+            last_tick = self._last_tick_time
 
         age = 0.0
-        if last_change is not None:
-            age = (datetime.now(EST) - last_change).total_seconds()
+        if last_tick is not None:
+            age = (datetime.now(EST) - last_tick).total_seconds()
 
         return spot, age
 
