@@ -34,6 +34,12 @@ SCANNER_SOURCE = "scanner"
 _init_lock = threading.Lock()
 _writer_instance: "SupabaseScannerWriter | None" = None
 
+# Cap how many dead-letter entries a single drain pass will attempt. A large
+# backlog is drained over several passes instead of one unbounded burst, so the
+# writer can never open a storm of cloud connections at once (which previously
+# exhausted file descriptors and left hundreds of sockets in CLOSE_WAIT).
+_MAX_DRAIN_PER_PASS = 50
+
 
 def _to_cloud_row(local_id: int, row: dict[str, Any]) -> dict[str, Any]:
     """Map a local SQLite row to a cloud-ready dict."""
@@ -74,6 +80,10 @@ class SupabaseScannerWriter:
 
     def __init__(self) -> None:
         self._client: Optional[Client] = None
+        # Reentrancy guard: ensures retry_pending_writes() can never run nested
+        # (a drain calls write_scan, and a successful write_scan triggers a
+        # drain — without this flag those recurse and storm cloud connections).
+        self._draining = False
 
     def _get_client(self) -> Client:
         """Create the Supabase client on first use (thread-safe)."""
@@ -104,14 +114,18 @@ class SupabaseScannerWriter:
             client.schema(CLOUD_SCHEMA).table(CLOUD_TABLE).insert(cloud_row).execute()
             logger.info("[scanner_writer] wrote scan local_id=%s ts=%s",
                         local_id, cloud_row.get("timestamp_est"))
-            # Opportunistically drain any dead-letter entries now that writes work again
-            try:
-                succeeded, failed = self.retry_pending_writes()
-                if succeeded or failed:
-                    logger.info("[scanner_writer] drained dead-letter: %d succeeded, %d failed",
-                                succeeded, failed)
-            except Exception as e:
-                logger.debug("[scanner_writer] dead-letter drain skipped: %s", e)
+            # Opportunistically drain any dead-letter entries now that writes
+            # work again — but ONLY for live writes. Retries (from_retry=True)
+            # are themselves issued from inside a drain, so draining here would
+            # recurse and open an unbounded storm of cloud connections.
+            if not from_retry:
+                try:
+                    succeeded, failed = self.retry_pending_writes()
+                    if succeeded or failed:
+                        logger.info("[scanner_writer] drained dead-letter: %d succeeded, %d failed",
+                                    succeeded, failed)
+                except Exception as e:
+                    logger.debug("[scanner_writer] dead-letter drain skipped: %s", e)
             return True
         except Exception as e:
             err_str = str(e)
@@ -165,6 +179,19 @@ class SupabaseScannerWriter:
         """
         if not PENDING_WRITES_PATH.exists():
             return (0, 0)
+        # Hard reentrancy guard: never let a drain run nested inside another
+        # drain. Belt-and-suspenders alongside the from_retry check in
+        # write_scan — together they make a connection storm impossible.
+        if self._draining:
+            return (0, 0)
+        self._draining = True
+        try:
+            return self._drain_pending_writes()
+        finally:
+            self._draining = False
+
+    def _drain_pending_writes(self) -> tuple[int, int]:
+        """Single bounded drain pass — see retry_pending_writes for semantics."""
         entries: list[dict[str, Any]] = []
         with PENDING_WRITES_PATH.open("r", encoding="utf-8") as f:
             for line in f:
@@ -178,11 +205,15 @@ class SupabaseScannerWriter:
         succeeded = 0
         failed = 0
         already_in_cloud = 0
-        for entry in entries:
+        # Bound work per pass so a large backlog drains gradually rather than in
+        # one unbounded burst of cloud connections. Entries past the cap, and
+        # any that fail this pass, are kept for the next pass.
+        remaining: list[dict[str, Any]] = list(entries[_MAX_DRAIN_PER_PASS:])
+        for entry in entries[:_MAX_DRAIN_PER_PASS]:
             local_id = entry.get("local_id")
             row = entry.get("row", {})
             if local_id is None:
-                failed += 1
+                failed += 1  # malformed entry — drop it (no local_id to retry)
                 continue
             # Pre-flight: skip if row is already in cloud
             if self._local_id_in_cloud(int(local_id)):
@@ -193,19 +224,34 @@ class SupabaseScannerWriter:
                     succeeded += 1
                 else:
                     failed += 1
+                    remaining.append(entry)
             except Exception as e:
                 failed += 1
+                remaining.append(entry)
                 logger.warning("[scanner_writer] retry error (local_id=%s): %s",
                                local_id, e)
         if already_in_cloud:
             logger.info("[scanner_writer] skipped %d dead-letter entries (already in cloud)",
                         already_in_cloud)
-        if failed == 0:
-            try:
-                PENDING_WRITES_PATH.unlink()
-            except FileNotFoundError:
-                pass
+        # Persist exactly the unresolved entries: remove the file when nothing
+        # remains, otherwise atomically rewrite it with the leftovers so we
+        # neither lose un-drained rows nor re-attempt resolved ones.
+        self._rewrite_pending(remaining)
         return (succeeded, failed)
+
+    def _rewrite_pending(self, remaining: list[dict[str, Any]]) -> None:
+        """Replace the dead-letter file with ``remaining`` (or delete if empty)."""
+        try:
+            if not remaining:
+                PENDING_WRITES_PATH.unlink(missing_ok=True)
+                return
+            tmp = PENDING_WRITES_PATH.with_suffix(PENDING_WRITES_PATH.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                for entry in remaining:
+                    f.write(json.dumps(entry, default=str) + "\n")
+            tmp.replace(PENDING_WRITES_PATH)
+        except Exception as e:
+            logger.error("[scanner_writer] CRITICAL: failed to rewrite dead-letter file: %s", e)
 
 
 def get_writer() -> SupabaseScannerWriter:
