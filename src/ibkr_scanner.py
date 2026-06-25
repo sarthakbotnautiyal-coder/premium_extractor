@@ -71,6 +71,12 @@ ANCHOR_NEIGHBOURHOOD_STRIKES = 10 # warm re-anchor: search ±10 strikes (~±50pt
 # (a frozen feed can report a static value with a fresh timer).
 TV_SPOT_STALENESS_SECS   = 90    # reject TV spot if its latest row is older than this
 TV_CROSSCHECK_DIVERGENCE = 15.0  # pts: index vs TV disagreement that flags a frozen index feed
+# Sticky-value guard: a live SPX index feed essentially never reprints the exact
+# same price on two consecutive scans (~60s apart). Identical back-to-back
+# readings mean the feed is stuck on a stale level while its snapshot timer stays
+# fresh — a small (<TV_CROSSCHECK_DIVERGENCE) sticky error otherwise slips past
+# both the staleness and divergence guards.
+STICKY_SPOT_GUARD = True
 # ----------------------------
 
 
@@ -390,6 +396,9 @@ class ScanCache:
         self.expiry = None
         self.contracts_by_strike_right = {}
         self.last_spot = None
+        # Raw IBKR index spot from the previous scan (before any TV override),
+        # used by the sticky-value guard to spot a feed stuck on a stale level.
+        self.prev_primary_spot = None
         self._reset_anchor()
 
     def _reset_anchor(self):
@@ -411,6 +420,7 @@ class ScanCache:
         self.chain = None
         self.expiry = None
         self.contracts_by_strike_right = {}
+        self.prev_primary_spot = None
         self._reset_anchor()
 
 
@@ -590,6 +600,23 @@ def _build_working_set(ib: IB, cache: ScanCache) -> list:
     return out
 
 
+def _is_sticky_spot(primary_spot: float, prev_primary_spot) -> bool:
+    """True when the index feed reprinted the exact same price two scans running.
+
+    A live SPX index feed practically never returns the identical value on two
+    consecutive scans (~60s apart); when it does, the feed is stuck on a stale
+    level while its snapshot timer stays fresh. Returns False on the first scan
+    (no prior reading) or any NaN reading.
+    """
+    if not STICKY_SPOT_GUARD:
+        return False
+    if math.isnan(primary_spot):
+        return False
+    if prev_primary_spot is None or math.isnan(prev_primary_spot):
+        return False
+    return primary_spot == prev_primary_spot
+
+
 def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer) -> dict:
     """Run one scan cycle. Returns result dict."""
     # 1) SPX spot from the dedicated spot-feed connection (isolated from the
@@ -599,10 +626,20 @@ def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer
 
     spot, spot_age = spot_feed.get_spot()
 
+    # Raw index reading, captured before any TV override below so the sticky
+    # guard always compares index-to-index across scans.
+    primary_spot = spot
+
     # True staleness check: has the price actually CHANGED recently? We track the
     # last PRICE CHANGE timestamp, since a frozen feed still reports a fresh
     # ticker.time on snapshot requests.
     primary_ok = (not math.isnan(spot)) and (spot_age <= SPOT_STALENESS_SECS)
+
+    # Sticky-value guard: identical index readings on two consecutive scans mean
+    # the feed is stuck on a stale level (see STICKY_SPOT_GUARD note above).
+    sticky = _is_sticky_spot(primary_spot, cache.prev_primary_spot)
+    if not math.isnan(primary_spot):
+        cache.prev_primary_spot = primary_spot
 
     # TV fallback spot (~1 row/min, ≤~60s fresh) from tradingview.db. Used when
     # the IBKR index feed freezes, and as an independent cross-check even when
@@ -610,6 +647,22 @@ def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer
     # timer). Reject it if TV's own upstream process has stalled.
     tv_price, tv_age = get_tv_spot()
     tv_ok = (tv_price is not None) and (tv_age is not None) and (tv_age <= TV_SPOT_STALENESS_SECS)
+
+    # Sticky index value: distrust the index feed and prefer TV. If TV isn't
+    # available to substitute we can't do better than the suspect value, so keep
+    # it but log loudly rather than aborting the scan.
+    if primary_ok and sticky:
+        if tv_ok:
+            log.warning(
+                f"SPX index feed sticky: identical value {primary_spot:.2f} on two "
+                f"consecutive scans — distrusting index feed, using TV={tv_price:.2f}."
+            )
+            primary_ok = False
+        else:
+            log.warning(
+                f"SPX index feed sticky: identical value {primary_spot:.2f} on two "
+                "consecutive scans, but TV cross-check unavailable — using it anyway."
+            )
 
     # Cross-check: a fresh-looking index feed that disagrees with TV by a wide
     # margin is the frozen-but-timer-fresh case — distrust the index feed.
