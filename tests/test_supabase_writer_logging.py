@@ -9,6 +9,7 @@ back.
 from __future__ import annotations
 
 import logging
+import socket
 from pathlib import Path
 
 import pytest
@@ -704,3 +705,96 @@ def test_enqueue_logs_critical_on_write_failure(
     assert ok is False
     err_msgs = [r.getMessage() for r in caplog.records if r.name == "scanner" and r.levelno == logging.ERROR]
     assert any("CRITICAL" in m and "failed to enqueue dead-letter" in m for m in err_msgs), err_msgs
+
+
+# --------------------------------------------------------------------------
+# DNS-failure recovery: a long-lived client can end up holding a stale
+# resolver/socket state (e.g. after the host's network config changes),
+# causing every subsequent write to fail with socket.gaierror even once
+# DNS is healthy again. write_scan must detect that and drop the cached
+# client so the next call rebuilds a fresh one.
+# --------------------------------------------------------------------------
+
+
+def test_is_dns_error_detects_top_level_gaierror() -> None:
+    assert sw._is_dns_error(socket.gaierror(8, "nodename nor servname provided, or not known"))
+
+
+def test_is_dns_error_detects_chained_gaierror() -> None:
+    """httpx wraps the raw socket.gaierror — it should be found via __cause__."""
+    gai = socket.gaierror(8, "nodename nor servname provided, or not known")
+    wrapped = RuntimeError("httpx.ConnectError")
+    wrapped.__cause__ = gai
+    assert sw._is_dns_error(wrapped)
+
+
+def test_is_dns_error_false_for_unrelated_error() -> None:
+    assert not sw._is_dns_error(RuntimeError("duplicate key value violates unique constraint"))
+
+
+def test_write_scan_dns_failure_resets_client(
+    fresh_writer, tmp_pending_writes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A DNS-error write failure must drop the cached client so the next
+    write_scan call builds a fresh one instead of reusing stale state."""
+    client = MagicMock()
+    schema = MagicMock()
+    table = MagicMock()
+    table.insert.return_value.execute.side_effect = socket.gaierror(
+        8, "nodename nor servname provided, or not known"
+    )
+    client.schema.return_value = schema
+    schema.table.return_value = table
+    fresh_writer._client = client
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        ok = fresh_writer.write_scan(local_id=21, row={"timestamp_est": "t"})
+
+    assert ok is False
+    assert fresh_writer._client is None, "stale client must be dropped on DNS failure"
+    warn_msgs = [r.getMessage() for r in caplog.records if r.name == "scanner" and r.levelno == logging.WARNING]
+    assert any("rebuilding Supabase client" in m for m in warn_msgs), warn_msgs
+
+
+def test_write_scan_recovers_after_dns_failure_with_fresh_client(
+    fresh_writer, tmp_pending_writes
+) -> None:
+    """End-to-end: a DNS failure followed by a healthy client on the next
+    attempt must succeed, proving _get_client() rebuilds rather than
+    reusing the dropped client."""
+    bad_client = MagicMock()
+    bad_schema = MagicMock()
+    bad_table = MagicMock()
+    bad_table.insert.return_value.execute.side_effect = socket.gaierror(
+        8, "nodename nor servname provided, or not known"
+    )
+    bad_client.schema.return_value = bad_schema
+    bad_schema.table.return_value = bad_table
+    fresh_writer._client = bad_client
+
+    ok1 = fresh_writer.write_scan(local_id=22, row={"timestamp_est": "t"})
+    assert ok1 is False
+    assert fresh_writer._client is None
+
+    good_client = _make_mock_client()
+    fresh_writer._get_client = MagicMock(return_value=good_client)
+    fresh_writer.retry_pending_writes = MagicMock(return_value=(0, 0))
+
+    ok2 = fresh_writer.write_scan(local_id=23, row={"timestamp_est": "t"})
+    assert ok2 is True
+
+
+def test_local_id_in_cloud_resets_client_on_dns_error(fresh_writer) -> None:
+    client = MagicMock()
+    schema = MagicMock()
+    table = MagicMock()
+    table.select.return_value.eq.return_value.limit.return_value.execute.side_effect = (
+        socket.gaierror(8, "nodename nor servname provided, or not known")
+    )
+    client.schema.return_value = schema
+    schema.table.return_value = table
+    fresh_writer._client = client
+
+    result = fresh_writer._local_id_in_cloud(5)
+    assert result is False
+    assert fresh_writer._client is None

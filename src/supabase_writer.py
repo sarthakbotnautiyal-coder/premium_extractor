@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -39,6 +40,22 @@ _writer_instance: "SupabaseScannerWriter | None" = None
 # writer can never open a storm of cloud connections at once (which previously
 # exhausted file descriptors and left hundreds of sockets in CLOSE_WAIT).
 _MAX_DRAIN_PER_PASS = 50
+
+
+def _is_dns_error(exc: BaseException) -> bool:
+    """True if exc (or anything chained under it) is a DNS resolution failure.
+
+    httpx wraps the underlying socket.gaierror, so we have to walk
+    __cause__/__context__ rather than checking the top-level exception type.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _to_cloud_row(local_id: int, row: dict[str, Any]) -> dict[str, Any]:
@@ -93,6 +110,18 @@ class SupabaseScannerWriter:
                     self._client = _create_client()
         return self._client
 
+    def _reset_client(self) -> None:
+        """Drop the cached client so the next call builds a fresh one.
+
+        A DNS failure on a long-lived client can mean the underlying
+        httpx connection pool is holding a stale resolver/socket state
+        (e.g. after the host's network config changed). A fresh client
+        picks up the current resolver, so we discard the old one rather
+        than reusing it on every subsequent attempt.
+        """
+        with _init_lock:
+            self._client = None
+
     def write_scan(self, local_id: int, row: dict[str, Any], from_retry: bool = False) -> bool:
         """Dual-write a scan result row to Supabase.
 
@@ -132,6 +161,9 @@ class SupabaseScannerWriter:
             is_duplicate = "duplicate key" in err_str.lower()
             logger.warning("[scanner_writer] cloud write failed (local_id=%s, duplicate=%s): %s",
                            local_id, is_duplicate, err_str)
+            if _is_dns_error(e):
+                logger.warning("[scanner_writer] DNS resolution failed — rebuilding Supabase client")
+                self._reset_client()
             # Re-enqueue only if this wasn't a retry AND it isn't a duplicate
             # (duplicates mean the row is already in the cloud — no point retrying)
             if not from_retry and not is_duplicate:
@@ -166,6 +198,8 @@ class SupabaseScannerWriter:
         except Exception as e:
             logger.debug("[scanner_writer] existence check failed (local_id=%s): %s",
                          local_id, e)
+            if _is_dns_error(e):
+                self._reset_client()
             return False
 
     def retry_pending_writes(self) -> tuple[int, int]:
