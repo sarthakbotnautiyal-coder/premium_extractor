@@ -45,16 +45,18 @@ def get_tv_spot() -> tuple[Optional[float], Optional[float]]:
         finally:
             conn.close()
     except Exception as e:
-        _LOG.warning("get_tv_spot: DB read failed: %s", e)
+        _LOG.debug("get_tv_spot: DB read failed: %s (path=%s)", e, TV_DB)
         return None, None
 
     if not row or row[0] is None or row[1] is None:
+        _LOG.debug("get_tv_spot: no rows found in spx_standardized (alert_type='fundamentals')")
         return None, None
 
     price, received_at = row
     try:
         ts = datetime.fromisoformat(received_at)
     except (ValueError, TypeError):
+        _LOG.debug("get_tv_spot: invalid timestamp format: %s", received_at)
         return float(price), None
     now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
     age = (now - ts).total_seconds()

@@ -649,8 +649,7 @@ def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer
     tv_ok = (tv_price is not None) and (tv_age is not None) and (tv_age <= TV_SPOT_STALENESS_SECS)
 
     # Sticky index value: distrust the index feed and prefer TV. If TV isn't
-    # available to substitute we can't do better than the suspect value, so keep
-    # it but log loudly rather than aborting the scan.
+    # available to substitute, force a reconnect (the proven cure for frozen feeds).
     if primary_ok and sticky:
         if tv_ok:
             log.warning(
@@ -661,8 +660,15 @@ def run_scan(ib: IB, cache: ScanCache, spot_feed: SpxSpotFeed, legs: LegStreamer
         else:
             log.warning(
                 f"SPX index feed sticky: identical value {primary_spot:.2f} on two "
-                "consecutive scans, but TV cross-check unavailable — using it anyway."
+                "consecutive scans — forcing SPX feed reconnect (TV cross-check unavailable)."
             )
+            force_anchor = True
+            primary_ok = False
+            try:
+                if spot_feed.force_full_reconnect():
+                    log.info("SPX spot feed full reconnect issued.")
+            except Exception as e:
+                log.warning(f"SPX spot feed full reconnect failed: {e}")
 
     # Cross-check: a fresh-looking index feed that disagrees with TV by a wide
     # margin is the frozen-but-timer-fresh case — distrust the index feed.
